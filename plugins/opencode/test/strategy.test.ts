@@ -51,6 +51,56 @@ describe("Rift workspace strategy", () => {
     ])
   })
 
+  test("checks out a starting ref in the new snapshot", async () => {
+    const { calls } = fixture()
+    const checkouts: Array<[string, string]> = []
+    const strategy = makeStrategy(
+      { copyAll: false },
+      {
+        rpc: async (_executable, request) => {
+          calls.push(request)
+          return "/worktrees/task"
+        },
+        checkout: async (directory, ref) => {
+          checkouts.push([directory, ref])
+        },
+      },
+    )
+    await expect(
+      strategy.create({ sourceDirectory: "/project", directory: "/worktrees/task", branch: "main" }, context),
+    ).resolves.toEqual({ directory: "/worktrees/task" })
+    expect(checkouts).toEqual([["/worktrees/task", "main"]])
+    expect(calls.map((call) => ("command" in call ? call.command : undefined))).toEqual(["create"])
+  })
+
+  test("removes the snapshot when the starting ref cannot be checked out", async () => {
+    const calls: object[] = []
+    const strategy = makeStrategy(
+      {},
+      {
+        rpc: async (_executable, request) => {
+          calls.push(request)
+          return "command" in request && request.command === "create" ? "/worktrees/task" : null
+        },
+        checkout: async () => {
+          throw new Error("fatal: invalid reference: nope")
+        },
+      },
+    )
+    await expect(
+      strategy.create({ sourceDirectory: "/project", directory: "/worktrees/task", branch: "nope" }, context),
+    ).rejects.toThrow("Rift could not start the workspace at nope: fatal: invalid reference: nope")
+    expect(calls.at(-1)).toEqual({ database: undefined, command: "remove", at: "/worktrees/task", hooks: true })
+  })
+
+  test("rejects option-like refs before creating anything", async () => {
+    const { calls, strategy } = fixture()
+    await expect(
+      strategy.create({ sourceDirectory: "/project", directory: "/worktrees/task", branch: "--orphan" }, context),
+    ).rejects.toThrow("Invalid starting ref: --orphan")
+    expect(calls).toEqual([])
+  })
+
   test("discovers descendants and removes only leaves", async () => {
     const { calls, children, strategy } = fixture()
     await expect(strategy.list("/project", context)).resolves.toEqual([

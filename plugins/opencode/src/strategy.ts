@@ -1,6 +1,7 @@
 import { Worktree } from "@opencode/plugin"
 import path from "node:path"
 import { RpcError, rpc } from "./command.js"
+import { checkout } from "./git.js"
 
 interface Options {
   executable: string
@@ -17,6 +18,7 @@ export interface Warning {
 interface Runtime {
   warning?: (input: Warning) => void
   rpc?: typeof rpc
+  checkout?: typeof checkout
 }
 
 const hints: Partial<Record<string, string>> = {
@@ -46,6 +48,7 @@ function parseOptions(value: Record<string, unknown>): Options {
 export function makeStrategy(value: Record<string, unknown> = {}, runtime: Runtime = {}) {
   const options = parseOptions(value)
   const call = runtime.rpc ?? rpc
+  const switchTo = runtime.checkout ?? checkout
   const request = (command: object, signal: AbortSignal) =>
     call(options.executable, { database: options.database, ...command }, signal)
   const failure = (error: unknown) => {
@@ -64,9 +67,11 @@ export function makeStrategy(value: Record<string, unknown> = {}, runtime: Runti
   return {
     id: "rift",
     async create(input: { sourceDirectory: string; directory: string; branch?: string }, context: { signal: AbortSignal }) {
-      if (input.branch) throw new Worktree.OperationError({ message: "Rift snapshots do not support starting refs" })
+      const ref = input.branch
+      if (ref?.startsWith("-")) throw new Worktree.OperationError({ message: `Invalid starting ref: ${ref}` })
+      let directory: string
       try {
-        const directory = await request(
+        const created = await request(
           {
             command: "create",
             from: input.sourceDirectory,
@@ -77,14 +82,26 @@ export function makeStrategy(value: Record<string, unknown> = {}, runtime: Runti
           },
           context.signal,
         )
-        if (typeof directory !== "string") throw new Error("Rift create returned an invalid path")
-        return { directory }
+        if (typeof created !== "string") throw new Error("Rift create returned an invalid path")
+        directory = created
       } catch (error) {
-        const directory = committed(error, "postcreate")
-        if (!directory) throw failure(error)
-        runtime.warning?.({ directory, message: (error as Error).message })
-        return { directory }
+        const created = committed(error, "postcreate")
+        if (!created) throw failure(error)
+        runtime.warning?.({ directory: created, message: (error as Error).message })
+        directory = created
       }
+      if (!ref) return { directory }
+      try {
+        await switchTo(directory, ref, context.signal)
+      } catch (error) {
+        // The caller may already be aborted, so clean up under a fresh deadline.
+        await request({ command: "remove", at: directory, hooks: options.hooks }, AbortSignal.timeout(60_000)).catch(
+          () => undefined,
+        )
+        const message = error instanceof Error ? error.message : String(error)
+        throw new Worktree.OperationError({ message: `Rift could not start the workspace at ${ref}: ${message}` })
+      }
+      return { directory }
     },
     async remove(input: { directory: string; force: boolean }, context: { signal: AbortSignal }) {
       const children = paths(

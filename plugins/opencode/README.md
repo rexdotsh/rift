@@ -31,7 +31,9 @@ Move sessions with OpenCode's `opencode.session_move` tool.
 
 ## Limits
 
-- Starting refs are not supported; Rift snapshots a working directory, not a commit.
+- A starting ref snapshots the source, then runs `git switch --detach <ref>` in the new workspace. Uncommitted
+  source changes carry over when they don't conflict; on a conflict or unknown ref the workspace is removed and
+  creation fails. Postcreate hooks run before the switch.
 - Remove a workspace's child Rifts before removing it.
 - `rift.remove` refuses to remove the workspace the current session is in.
 - Windows can't create workspaces, because Rift needs copy-on-write cloning.

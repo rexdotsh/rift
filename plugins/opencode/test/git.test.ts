@@ -53,7 +53,7 @@ describe("starting ref checkout", () => {
 
 describe("unsaved work check", () => {
   // A pushed source checkout, copied the way Rift copies it: the whole directory, `.git` included.
-  function workspaces() {
+  function workspaces(options: { submodule?: boolean } = {}) {
     const root = mkdtempSync(path.join(tmpdir(), "rift-unsaved-"))
     directories.push(root)
     const run = (cwd: string, ...args: string[]) =>
@@ -70,6 +70,17 @@ describe("unsaved work check", () => {
     run(source, "add", ".")
     run(source, "commit", "-q", "-m", "main")
     run(source, "push", "-q", "origin", "main")
+    if (options.submodule) {
+      run(root, "init", "-q", "--bare", "-b", "main", "lib.git")
+      run(root, "clone", "-q", path.join(root, "lib.git"), "lib-seed")
+      writeFileSync(path.join(root, "lib-seed", "lib.txt"), "lib\n")
+      run(path.join(root, "lib-seed"), "add", ".")
+      run(path.join(root, "lib-seed"), "commit", "-q", "-m", "lib")
+      run(path.join(root, "lib-seed"), "push", "-q", "origin", "main")
+      run(source, "-c", "protocol.file.allow=always", "submodule", "add", "-q", path.join(root, "lib.git"), "lib")
+      run(source, "commit", "-q", "-m", "add lib")
+      run(source, "push", "-q", "origin", "main")
+    }
     const copy = (name: string) => {
       const directory = path.join(root, name)
       cpSync(source, directory, { recursive: true })
@@ -184,5 +195,20 @@ describe("unsaved work check", () => {
     await expect(check(directory, undefined)).resolves.toMatch("1 commit no remote branch has")
     commit(directory, "child")
     await expect(check(directory, source)).resolves.toMatch("2 commits no remote branch has")
+  })
+
+  test("repository and user config can't hide work", async () => {
+    const { copy, commit, run } = workspaces({ submodule: true })
+    const untracked = copy("untracked-hidden")
+    run(untracked, "config", "status.showUntrackedFiles", "no")
+    writeFileSync(path.join(untracked, "draft.txt"), "x\n")
+    await expect(check(untracked)).resolves.toMatch("uncommitted changes (draft.txt)")
+
+    // The submodule's new commit is pushed, but the superproject's gitlink change is only here.
+    const gitlink = copy("gitlink-ignored")
+    run(gitlink, "config", "submodule.lib.ignore", "all")
+    commit(path.join(gitlink, "lib"), "pushed")
+    run(path.join(gitlink, "lib"), "push", "-q", "origin", "HEAD:main")
+    await expect(check(gitlink)).resolves.toMatch("uncommitted changes (lib)")
   })
 })

@@ -36,7 +36,13 @@ export async function unsaved(
 ): Promise<string | undefined> {
   if (!existsSync(path.join(directory, ".git"))) return
   const [status, head] = await Promise.all([
-    git(directory, ["--no-optional-locks", "status", "--porcelain"], signal),
+    // Explicit, so repository or user config (status.showUntrackedFiles=no, submodule.<name>.ignore=all) can't hide
+    // work. Ignored files still don't count, as with `git worktree remove`.
+    git(
+      directory,
+      ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"],
+      signal,
+    ),
     git(directory, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], signal).then(
       (output) => output.trim(),
       () => undefined,

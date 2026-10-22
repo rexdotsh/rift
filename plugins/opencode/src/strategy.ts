@@ -1,7 +1,7 @@
 import { Worktree } from "@opencode/plugin"
 import path from "node:path"
 import { RpcError, rpc } from "./command.js"
-import { checkout } from "./git.js"
+import { checkout, unsaved } from "./git.js"
 
 interface Options {
   executable: string
@@ -19,6 +19,7 @@ interface Runtime {
   warning?: (input: Warning) => void
   rpc?: typeof rpc
   checkout?: typeof checkout
+  unsaved?: typeof unsaved
 }
 
 const hints: Partial<Record<string, string>> = {
@@ -49,6 +50,7 @@ export function makeStrategy(value: Record<string, unknown> = {}, runtime: Runti
   const options = parseOptions(value)
   const call = runtime.rpc ?? rpc
   const switchTo = runtime.checkout ?? checkout
+  const inspect = runtime.unsaved ?? unsaved
   const request = (command: object, signal: AbortSignal) =>
     call(options.executable, { database: options.database, ...command }, signal)
   const failure = (error: unknown) => {
@@ -111,6 +113,15 @@ export function makeStrategy(value: Record<string, unknown> = {}, runtime: Runti
       )
       if (children.length)
         throw new Worktree.OperationError({ message: "Remove this Rift's child workspaces first" })
+      // Like `git worktree remove`, only force discards work; here that includes commits only this workspace has.
+      if (!input.force) {
+        const parent = async () =>
+          paths(await request({ command: "ancestors", of: input.directory }, context.signal))[0]
+        const reason = await inspect(input.directory, parent, context.signal).catch((error) => {
+          throw failure(error)
+        })
+        if (reason) throw new Worktree.OperationError({ message: reason, forceRequired: true })
+      }
       try {
         await request({ command: "remove", at: input.directory, hooks: options.hooks }, context.signal)
       } catch (error) {

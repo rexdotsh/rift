@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test"
+import { execFileSync } from "node:child_process"
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -100,6 +101,18 @@ test("rift.remove reports a failed postremove hook to the agent", async () => {
   expect(result.content).toBe(
     "Removed /worktrees/task.\n\nWarning: postremove hook failed: ERR_PNPM_FETCH_401 token expired",
   )
+})
+
+test("rift.remove keeps a workspace with uncommitted changes unless forced", async () => {
+  const tools = await setup(await fakeRift())
+  const directory = await mkdtemp(join(temp, "workspace-"))
+  execFileSync("git", ["init", "-q", directory])
+  await writeFile(join(directory, "notes.txt"), "draft\n")
+  await expect(tools.get("remove")!.execute({ directory }, { sessionID: "session" })).rejects.toThrow(
+    `${directory} has uncommitted changes (notes.txt)`,
+  )
+  const result = await tools.get("remove")!.execute({ directory, force: true }, { sessionID: "session" })
+  expect(result.content).toBe(`Removed ${directory}.`)
 })
 
 test("successful hooks add no warning", async () => {

@@ -115,11 +115,15 @@ export async function registerTools(ctx: Context, listeners: Listeners) {
     editor.add({
       name: "remove",
       description:
-        "Remove a Rift workspace from the current project. Refuses the workspace this session is in and workspaces that still have child workspaces.",
+        "Remove a Rift workspace from the current project. Refuses the workspace this session is in and workspaces that still have child workspaces. Unless force is true, also refuses one with uncommitted changes or commits no remote branch has, and says which.",
       input: {
         type: "object",
         properties: {
           directory: { type: "string", description: "Absolute workspace path." },
+          force: {
+            type: "boolean",
+            description: "Remove it even with uncommitted changes or unpushed commits, discarding them.",
+          },
         },
         required: ["directory"],
         additionalProperties: false,
@@ -135,7 +139,7 @@ export async function registerTools(ctx: Context, listeners: Listeners) {
       },
       options: { namespace: "rift", codemode: true },
       async execute(input, tool) {
-        const value = input as { directory: string }
+        const value = input as { directory: string; force?: boolean }
         const session = await ctx.session.get({ sessionID: tool.sessionID })
         if (contains(value.directory, session.location.directory))
           throw new Error("Move this session out of the Rift before removing it")
@@ -143,7 +147,7 @@ export async function registerTools(ctx: Context, listeners: Listeners) {
           ctx.worktree.remove({
             projectID: session.projectID,
             directory: value.directory,
-            force: false,
+            force: value.force ?? false,
           }),
         )
         return report(value.directory, `Removed ${value.directory}.`, warning(value.directory))

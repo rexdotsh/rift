@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { execFileSync } from "node:child_process"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { checkout } from "../src/git.js"
+import { checkout, unsaved } from "../src/git.js"
 
 const directories: string[] = []
 const context = { signal: new AbortController().signal }
@@ -48,5 +48,141 @@ describe("starting ref checkout", () => {
     const { directory } = repository()
     writeFileSync(path.join(directory, "file.txt"), "dirty\n")
     await expect(checkout(directory, "feature", context.signal)).rejects.toThrow("would be overwritten")
+  })
+})
+
+describe("unsaved work check", () => {
+  // A pushed source checkout, copied the way Rift copies it: the whole directory, `.git` included.
+  function workspaces() {
+    const root = mkdtempSync(path.join(tmpdir(), "rift-unsaved-"))
+    directories.push(root)
+    const run = (cwd: string, ...args: string[]) =>
+      execFileSync("git", ["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", ...args], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+    const source = path.join(root, "source")
+    run(root, "init", "-q", "--bare", "-b", "main", "origin.git")
+    run(root, "clone", "-q", path.join(root, "origin.git"), "source")
+    writeFileSync(path.join(source, ".gitignore"), "ignored/\n")
+    writeFileSync(path.join(source, "file.txt"), "main\n")
+    run(source, "add", ".")
+    run(source, "commit", "-q", "-m", "main")
+    run(source, "push", "-q", "origin", "main")
+    const copy = (name: string) => {
+      const directory = path.join(root, name)
+      cpSync(source, directory, { recursive: true })
+      run(directory, "switch", "-q", "--detach")
+      return directory
+    }
+    const commit = (directory: string, message: string) => {
+      writeFileSync(path.join(directory, `${message}.txt`), `${message}\n`)
+      run(directory, "add", ".")
+      run(directory, "commit", "-q", "-m", message)
+    }
+    return { root, source, copy, commit, run }
+  }
+
+  const check = (directory: string, parent?: string) => unsaved(directory, async () => parent, context.signal)
+
+  test("finds what only the workspace has", async () => {
+    const { root, source, copy, commit, run } = workspaces()
+    const cases: Array<[string, () => string, RegExp | undefined]> = [
+      ["fresh copy", () => copy("fresh"), undefined],
+      [
+        "ignored files only",
+        () => {
+          const directory = copy("ignored")
+          mkdirSync(path.join(directory, "ignored"))
+          writeFileSync(path.join(directory, "ignored", "build.log"), "x\n")
+          return directory
+        },
+        undefined,
+      ],
+      [
+        "untracked file",
+        () => {
+          const directory = copy("untracked")
+          writeFileSync(path.join(directory, "new.txt"), "x\n")
+          return directory
+        },
+        /has uncommitted changes \(new\.txt\); commit or discard them\./,
+      ],
+      [
+        "modified file",
+        () => {
+          const directory = copy("modified")
+          writeFileSync(path.join(directory, "file.txt"), "changed\n")
+          return directory
+        },
+        /uncommitted changes \(file\.txt\)/,
+      ],
+      [
+        "unpushed commit",
+        () => {
+          const directory = copy("unpushed")
+          commit(directory, "local")
+          return directory
+        },
+        /has 1 commit no remote branch has \([0-9a-f]+ local\); push it\. Remove it with force/,
+      ],
+      [
+        "pushed branch",
+        () => {
+          const directory = copy("pushed")
+          run(directory, "switch", "-q", "-c", "feature")
+          commit(directory, "feature")
+          run(directory, "push", "-q", "origin", "feature")
+          return directory
+        },
+        undefined,
+      ],
+      [
+        "both",
+        () => {
+          const directory = copy("both")
+          commit(directory, "one")
+          commit(directory, "two")
+          writeFileSync(path.join(directory, "new.txt"), "x\n")
+          return directory
+        },
+        /uncommitted changes \(new\.txt\); commit or discard them, and 2 commits no remote branch has/,
+      ],
+      [
+        "unborn repository",
+        () => {
+          const directory = path.join(root, "unborn")
+          run(root, "init", "-q", directory)
+          return directory
+        },
+        undefined,
+      ],
+      [
+        "not a repository",
+        () => {
+          const directory = path.join(root, "plain")
+          mkdirSync(directory)
+          writeFileSync(path.join(directory, "notes.txt"), "x\n")
+          return directory
+        },
+        undefined,
+      ],
+    ]
+    for (const [name, make, expected] of cases) {
+      const result = await check(make(), source)
+      if (expected) expect({ name, result }).toEqual({ name, result: expect.stringMatching(expected) })
+      else expect({ name, result }).toEqual({ name, result: undefined })
+    }
+  })
+
+  test("commits the parent workspace still reaches are not lost", async () => {
+    const { source, copy, commit } = workspaces()
+    commit(source, "local")
+    const directory = copy("child")
+    await expect(check(directory, source)).resolves.toBeUndefined()
+    await expect(check(directory, undefined)).resolves.toMatch("1 commit no remote branch has")
+    commit(directory, "child")
+    await expect(check(directory, source)).resolves.toMatch("2 commits no remote branch has")
   })
 })

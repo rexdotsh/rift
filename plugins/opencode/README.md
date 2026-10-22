@@ -34,6 +34,18 @@ Move sessions with OpenCode's `opencode.session_move` tool.
 - A starting ref snapshots the source, then runs `git switch --detach <ref>` in the new workspace. Uncommitted
   source changes carry over when they don't conflict; on a conflict or unknown ref the workspace is removed and
   creation fails. Postcreate hooks run before the switch.
+- Removing without `force` refuses, as `git worktree remove` does, when the workspace has uncommitted changes
+  (tracked or untracked; ignored files don't count) or commits on `HEAD` that no remote-tracking branch has and the
+  workspace it was copied from can't reach either. A Rift's commits live only in its own `.git`, unlike a Git
+  worktree's. Initialized submodules are checked the same way, each against the parent's matching submodule. Git
+  config such as `status.showUntrackedFiles=no` or `submodule.<name>.ignore=all` doesn't hide anything. The error
+  lists the files and commits and sets `forceRequired`; a repository that can't be read refuses too. With `force`,
+  removal goes ahead and discards them. A workspace without its own `.git` isn't checked.
+- Rift's remove takes no precondition, so the check runs just before it, and the state it read (each repository's
+  `HEAD`, status and remote branches) is read again right before removal. A workspace that changed in between is
+  checked once more, then refused. Something written in the moment between that last read and Rift moving the
+  workspace to its trash goes with the workspace, and stays in the trash until `rift gc`.
 - Remove a workspace's child Rifts before removing it.
-- `rift.remove` refuses to remove the workspace the current session is in.
+- `rift.remove` refuses to remove the workspace the current session is in. Pass `force: true` to discard unsaved
+  work.
 - Windows can't create workspaces, because Rift needs copy-on-write cloning.

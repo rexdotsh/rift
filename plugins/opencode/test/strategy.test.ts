@@ -121,6 +121,72 @@ describe("Rift workspace strategy", () => {
     })
   })
 
+  test("refuses to discard unsaved work unless forced", async () => {
+    const calls: object[] = []
+    const inspected: Array<[string, string | undefined]> = []
+    const strategy = makeStrategy(
+      {},
+      {
+        rpc: async (_executable, request) => {
+          calls.push(request)
+          if ("command" in request && request.command === "list") return []
+          if ("command" in request && request.command === "ancestors") return ["/project"]
+          return null
+        },
+        unsaved: async (directory, parent) => {
+          inspected.push([directory, await parent()])
+          return {
+            reason: `${directory} has uncommitted changes (file.txt); commit or discard them. Remove it with force to discard them.`,
+            unchanged: async () => true,
+          }
+        },
+      },
+    )
+    const refused = await strategy.remove({ directory: "/rifts/one", force: false }, context).catch((error) => error)
+    expect(refused).toMatchObject({
+      message: expect.stringContaining("/rifts/one has uncommitted changes (file.txt)"),
+      forceRequired: true,
+    })
+    expect(inspected).toEqual([["/rifts/one", "/project"]])
+    expect(calls.map((call) => ("command" in call ? call.command : undefined))).toEqual(["list", "ancestors"])
+
+    calls.length = 0
+    await strategy.remove({ directory: "/rifts/one", force: true }, context)
+    expect(inspected).toHaveLength(1)
+    expect(calls.at(-1)).toEqual({ database: undefined, command: "remove", at: "/rifts/one", hooks: true })
+  })
+
+  test("checks a workspace that changed during the check once more, then refuses", async () => {
+    const run = async (results: boolean[]) => {
+      const removed: string[] = []
+      let inspections = 0
+      const strategy = makeStrategy(
+        {},
+        {
+          rpc: async (_executable, request) => {
+            if ("command" in request && request.command === "list") return []
+            if ("command" in request && request.command === "remove" && "at" in request) removed.push(String(request.at))
+            return null
+          },
+          unsaved: async () => {
+            const unchanged = results[inspections++]
+            return { reason: undefined, unchanged: async () => unchanged }
+          },
+        },
+      )
+      const outcome = await strategy
+        .remove({ directory: "/rifts/one", force: false }, context)
+        .then(() => "removed", (error: Error) => error.message)
+      return { outcome, inspections, removed }
+    }
+    expect(await run([false, true])).toEqual({ outcome: "removed", inspections: 2, removed: ["/rifts/one"] })
+    expect(await run([false, false])).toEqual({
+      outcome: "/rifts/one kept changing while it was checked; try again",
+      inspections: 2,
+      removed: [],
+    })
+  })
+
   test("explains initialization failures", async () => {
     const failing = (code: string) =>
       makeStrategy(

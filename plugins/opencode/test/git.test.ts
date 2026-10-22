@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { execFileSync } from "node:child_process"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { checkout } from "../src/git.js"
+import { checkout, unsaved } from "../src/git.js"
+import { makeStrategy } from "../src/strategy.js"
 
 const directories: string[] = []
 const context = { signal: new AbortController().signal }
@@ -48,5 +49,228 @@ describe("starting ref checkout", () => {
     const { directory } = repository()
     writeFileSync(path.join(directory, "file.txt"), "dirty\n")
     await expect(checkout(directory, "feature", context.signal)).rejects.toThrow("would be overwritten")
+  })
+})
+
+describe("unsaved work check", () => {
+  // A pushed source checkout, copied the way Rift copies it: the whole directory, `.git` included.
+  function workspaces(options: { submodule?: boolean } = {}) {
+    const root = mkdtempSync(path.join(tmpdir(), "rift-unsaved-"))
+    directories.push(root)
+    const run = (cwd: string, ...args: string[]) =>
+      execFileSync("git", ["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", ...args], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+    const source = path.join(root, "source")
+    run(root, "init", "-q", "--bare", "-b", "main", "origin.git")
+    run(root, "clone", "-q", path.join(root, "origin.git"), "source")
+    writeFileSync(path.join(source, ".gitignore"), "ignored/\n")
+    writeFileSync(path.join(source, "file.txt"), "main\n")
+    run(source, "add", ".")
+    run(source, "commit", "-q", "-m", "main")
+    run(source, "push", "-q", "origin", "main")
+    if (options.submodule) {
+      run(root, "init", "-q", "--bare", "-b", "main", "lib.git")
+      run(root, "clone", "-q", path.join(root, "lib.git"), "lib-seed")
+      writeFileSync(path.join(root, "lib-seed", "lib.txt"), "lib\n")
+      run(path.join(root, "lib-seed"), "add", ".")
+      run(path.join(root, "lib-seed"), "commit", "-q", "-m", "lib")
+      run(path.join(root, "lib-seed"), "push", "-q", "origin", "main")
+      run(source, "-c", "protocol.file.allow=always", "submodule", "add", "-q", path.join(root, "lib.git"), "lib")
+      run(source, "commit", "-q", "-m", "add lib")
+      run(source, "push", "-q", "origin", "main")
+    }
+    const copy = (name: string) => {
+      const directory = path.join(root, name)
+      cpSync(source, directory, { recursive: true })
+      run(directory, "switch", "-q", "--detach")
+      return directory
+    }
+    const commit = (directory: string, message: string) => {
+      writeFileSync(path.join(directory, `${message}.txt`), `${message}\n`)
+      run(directory, "add", ".")
+      run(directory, "commit", "-q", "-m", message)
+    }
+    return { root, source, copy, commit, run }
+  }
+
+  const check = async (directory: string, parent?: string) =>
+    (await unsaved(directory, async () => parent, context.signal)).reason
+
+  test("finds what only the workspace has", async () => {
+    const { root, source, copy, commit, run } = workspaces()
+    const cases: Array<[string, () => string, RegExp | undefined]> = [
+      ["fresh copy", () => copy("fresh"), undefined],
+      [
+        "ignored files only",
+        () => {
+          const directory = copy("ignored")
+          mkdirSync(path.join(directory, "ignored"))
+          writeFileSync(path.join(directory, "ignored", "build.log"), "x\n")
+          return directory
+        },
+        undefined,
+      ],
+      [
+        "untracked file",
+        () => {
+          const directory = copy("untracked")
+          writeFileSync(path.join(directory, "new.txt"), "x\n")
+          return directory
+        },
+        /has uncommitted changes \(new\.txt\); commit or discard them\./,
+      ],
+      [
+        "modified file",
+        () => {
+          const directory = copy("modified")
+          writeFileSync(path.join(directory, "file.txt"), "changed\n")
+          return directory
+        },
+        /uncommitted changes \(file\.txt\)/,
+      ],
+      [
+        "unpushed commit",
+        () => {
+          const directory = copy("unpushed")
+          commit(directory, "local")
+          return directory
+        },
+        /has 1 commit no remote branch has \([0-9a-f]+ local\); push it\. Remove it with force/,
+      ],
+      [
+        "pushed branch",
+        () => {
+          const directory = copy("pushed")
+          run(directory, "switch", "-q", "-c", "feature")
+          commit(directory, "feature")
+          run(directory, "push", "-q", "origin", "feature")
+          return directory
+        },
+        undefined,
+      ],
+      [
+        "both",
+        () => {
+          const directory = copy("both")
+          commit(directory, "one")
+          commit(directory, "two")
+          writeFileSync(path.join(directory, "new.txt"), "x\n")
+          return directory
+        },
+        /uncommitted changes \(new\.txt\); commit or discard them, and 2 commits no remote branch has/,
+      ],
+      [
+        "unborn repository",
+        () => {
+          const directory = path.join(root, "unborn")
+          run(root, "init", "-q", directory)
+          return directory
+        },
+        undefined,
+      ],
+      [
+        "not a repository",
+        () => {
+          const directory = path.join(root, "plain")
+          mkdirSync(directory)
+          writeFileSync(path.join(directory, "notes.txt"), "x\n")
+          return directory
+        },
+        undefined,
+      ],
+    ]
+    for (const [name, make, expected] of cases) {
+      const result = await check(make(), source)
+      if (expected) expect({ name, result }).toEqual({ name, result: expect.stringMatching(expected) })
+      else expect({ name, result }).toEqual({ name, result: undefined })
+    }
+  })
+
+  test("commits the parent workspace still reaches are not lost", async () => {
+    const { source, copy, commit } = workspaces()
+    commit(source, "local")
+    const directory = copy("child")
+    await expect(check(directory, source)).resolves.toBeUndefined()
+    await expect(check(directory, undefined)).resolves.toMatch("1 commit no remote branch has")
+    commit(directory, "child")
+    await expect(check(directory, source)).resolves.toMatch("2 commits no remote branch has")
+  })
+
+  test("repository and user config can't hide work", async () => {
+    const { copy, commit, run } = workspaces({ submodule: true })
+    const untracked = copy("untracked-hidden")
+    run(untracked, "config", "status.showUntrackedFiles", "no")
+    writeFileSync(path.join(untracked, "draft.txt"), "x\n")
+    await expect(check(untracked)).resolves.toMatch("uncommitted changes (draft.txt)")
+
+    const insideSubmodule = copy("submodule-untracked-hidden")
+    run(path.join(insideSubmodule, "lib"), "config", "status.showUntrackedFiles", "no")
+    writeFileSync(path.join(insideSubmodule, "lib", "draft.txt"), "x\n")
+    await expect(check(insideSubmodule)).resolves.toMatch("lib/draft.txt")
+
+    // The submodule's new commit is pushed, but the superproject's gitlink change is only here.
+    const gitlink = copy("gitlink-ignored")
+    run(gitlink, "config", "submodule.lib.ignore", "all")
+    commit(path.join(gitlink, "lib"), "pushed")
+    run(path.join(gitlink, "lib"), "push", "-q", "origin", "HEAD:main")
+    await expect(check(gitlink)).resolves.toMatch("uncommitted changes (lib)")
+  })
+
+  test("checks commits in initialized submodules against the matching parent submodule", async () => {
+    const { source, copy, commit, run } = workspaces({ submodule: true })
+    // Only the superproject is pushed; its gitlink points at a commit only this workspace's submodule has.
+    const child = copy("submodule-unpushed")
+    commit(path.join(child, "lib"), "local")
+    run(child, "add", "lib")
+    run(child, "commit", "-q", "-m", "bump lib")
+    run(child, "push", "-q", "--recurse-submodules=no", "origin", "HEAD:main")
+    await expect(check(child, source)).resolves.toMatch(/1 commit no remote branch has \(lib: [0-9a-f]+ local\)/)
+
+    // The parent and its own submodule still reach their unpushed commits, so a copy of them loses nothing.
+    commit(path.join(source, "lib"), "parent-local")
+    run(source, "add", "lib")
+    run(source, "commit", "-q", "-m", "bump lib in parent")
+    const copied = copy("submodule-from-parent")
+    await expect(check(copied, source)).resolves.toBeUndefined()
+    await expect(check(copied)).resolves.toMatch(/2 commits no remote branch has \([0-9a-f]+ bump lib in parent, lib: /)
+  })
+
+  test("refuses when a submodule can't be read", async () => {
+    const { copy } = workspaces({ submodule: true })
+    const broken = copy("submodule-broken")
+    writeFileSync(path.join(broken, "lib", ".git"), "gitdir: ../.git/modules/missing\n")
+    await expect(unsaved(broken, async () => undefined, context.signal)).rejects.toThrow("lib")
+  })
+
+  test("a commit made while the check runs isn't removed on a stale result", async () => {
+    const { source, copy, commit } = workspaces()
+    commit(source, "shared")
+    const child = copy("racing")
+    const removed: string[] = []
+    let raced = false
+    const strategy = makeStrategy(
+      {},
+      {
+        rpc: async (_executable, request) => {
+          if (!("command" in request)) return null
+          if (request.command === "list") return []
+          if (request.command === "ancestors") {
+            if (!raced) commit(child, "racing")
+            raced = true
+            return [source]
+          }
+          if (request.command === "remove" && "at" in request) removed.push(String(request.at))
+          return null
+        },
+      },
+    )
+    await expect(strategy.remove({ directory: child, force: false }, context)).rejects.toMatchObject({
+      message: expect.stringMatching(/2 commits no remote branch has \([0-9a-f]+ racing, [0-9a-f]+ shared\)/),
+      forceRequired: true,
+    })
+    expect(removed).toEqual([])
   })
 })

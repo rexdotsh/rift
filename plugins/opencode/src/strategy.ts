@@ -1,7 +1,7 @@
 import { Worktree } from "@opencode/plugin"
 import path from "node:path"
 import { RpcError, rpc } from "./command.js"
-import { checkout } from "./git.js"
+import { checkout, unsaved } from "./git.js"
 
 interface Options {
   executable: string
@@ -19,6 +19,7 @@ interface Runtime {
   warning?: (input: Warning) => void
   rpc?: typeof rpc
   checkout?: typeof checkout
+  unsaved?: typeof unsaved
 }
 
 const hints: Partial<Record<string, string>> = {
@@ -49,6 +50,7 @@ export function makeStrategy(value: Record<string, unknown> = {}, runtime: Runti
   const options = parseOptions(value)
   const call = runtime.rpc ?? rpc
   const switchTo = runtime.checkout ?? checkout
+  const inspect = runtime.unsaved ?? unsaved
   const request = (command: object, signal: AbortSignal) =>
     call(options.executable, { database: options.database, ...command }, signal)
   const failure = (error: unknown) => {
@@ -62,6 +64,23 @@ export function makeStrategy(value: Record<string, unknown> = {}, runtime: Runti
     if (!Array.isArray(value) || value.some((path) => typeof path !== "string"))
       throw new Worktree.OperationError({ message: "Rift returned invalid paths" })
     return value as string[]
+  }
+
+  // Rift's remove takes no precondition, so the check runs just before it: the state the reason came from is read
+  // again right before removal, and a workspace that changed in between is checked once more, then refused.
+  const keepUnsaved = async (directory: string, signal: AbortSignal) => {
+    const parent = async () => paths(await request({ command: "ancestors", of: directory }, signal))[0]
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const check = await inspect(directory, parent, signal).catch((error) => {
+        throw failure(error)
+      })
+      if (check.reason) throw new Worktree.OperationError({ message: check.reason, forceRequired: true })
+      const unchanged = await check.unchanged().catch((error) => {
+        throw failure(error)
+      })
+      if (unchanged) return
+    }
+    throw new Worktree.OperationError({ message: `${directory} kept changing while it was checked; try again` })
   }
 
   return {
@@ -111,6 +130,8 @@ export function makeStrategy(value: Record<string, unknown> = {}, runtime: Runti
       )
       if (children.length)
         throw new Worktree.OperationError({ message: "Remove this Rift's child workspaces first" })
+      // Like `git worktree remove`, only force discards work; here that includes commits only this workspace has.
+      if (!input.force) await keepUnsaved(input.directory, context.signal)
       try {
         await request({ command: "remove", at: input.directory, hooks: options.hooks }, context.signal)
       } catch (error) {

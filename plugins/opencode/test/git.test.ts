@@ -4,6 +4,7 @@ import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { checkout, unsaved } from "../src/git.js"
+import { makeStrategy } from "../src/strategy.js"
 
 const directories: string[] = []
 const context = { signal: new AbortController().signal }
@@ -95,7 +96,8 @@ describe("unsaved work check", () => {
     return { root, source, copy, commit, run }
   }
 
-  const check = (directory: string, parent?: string) => unsaved(directory, async () => parent, context.signal)
+  const check = async (directory: string, parent?: string) =>
+    (await unsaved(directory, async () => parent, context.signal)).reason
 
   test("finds what only the workspace has", async () => {
     const { root, source, copy, commit, run } = workspaces()
@@ -216,6 +218,7 @@ describe("unsaved work check", () => {
     run(path.join(gitlink, "lib"), "push", "-q", "origin", "HEAD:main")
     await expect(check(gitlink)).resolves.toMatch("uncommitted changes (lib)")
   })
+
   test("checks commits in initialized submodules against the matching parent submodule", async () => {
     const { source, copy, commit, run } = workspaces({ submodule: true })
     // Only the superproject is pushed; its gitlink points at a commit only this workspace's submodule has.
@@ -240,5 +243,34 @@ describe("unsaved work check", () => {
     const broken = copy("submodule-broken")
     writeFileSync(path.join(broken, "lib", ".git"), "gitdir: ../.git/modules/missing\n")
     await expect(unsaved(broken, async () => undefined, context.signal)).rejects.toThrow("lib")
+  })
+
+  test("a commit made while the check runs isn't removed on a stale result", async () => {
+    const { source, copy, commit } = workspaces()
+    commit(source, "shared")
+    const child = copy("racing")
+    const removed: string[] = []
+    let raced = false
+    const strategy = makeStrategy(
+      {},
+      {
+        rpc: async (_executable, request) => {
+          if (!("command" in request)) return null
+          if (request.command === "list") return []
+          if (request.command === "ancestors") {
+            if (!raced) commit(child, "racing")
+            raced = true
+            return [source]
+          }
+          if (request.command === "remove" && "at" in request) removed.push(String(request.at))
+          return null
+        },
+      },
+    )
+    await expect(strategy.remove({ directory: child, force: false }, context)).rejects.toMatchObject({
+      message: expect.stringMatching(/2 commits no remote branch has \([0-9a-f]+ racing, [0-9a-f]+ shared\)/),
+      forceRequired: true,
+    })
+    expect(removed).toEqual([])
   })
 })

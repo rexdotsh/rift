@@ -22,11 +22,19 @@ interface Repository {
   path: string
   head: string | undefined
   status: string
+  remotes: string
+}
+
+export interface Check {
+  /** What removing the workspace would lose, or undefined when nothing. */
+  reason: string | undefined
+  /** Whether every repository still has the HEAD, status and remote branches the reason was worked out from. */
+  unchanged: () => Promise<boolean>
 }
 
 async function read(root: string, relative: string, signal: AbortSignal): Promise<Repository> {
   const directory = path.join(root, relative)
-  const [head, status] = await Promise.all([
+  const [head, status, remotes] = await Promise.all([
     git(directory, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], signal).then(
       (output) => output.trim(),
       () => undefined,
@@ -38,8 +46,9 @@ async function read(root: string, relative: string, signal: AbortSignal): Promis
       ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"],
       signal,
     ),
+    git(directory, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes"], signal),
   ])
-  return { path: relative, head, status }
+  return { path: relative, head, status, remotes }
 }
 
 /** The workspace's repository and its initialized submodules, nested ones included. */
@@ -60,7 +69,7 @@ function list(items: string[]) {
 }
 
 /**
- * Says what removing `directory` would lose, or returns undefined when nothing: changes `git status` reports (untracked files included, ignored ones
+ * Works out what removing `directory` would lose: changes `git status` reports (untracked files included, ignored ones
  * not), and commits on HEAD that no remote-tracking branch has and the matching repository in the workspace it was
  * copied from (`parent`) can't reach either, in the workspace's repository and each initialized submodule. Unlike a
  * Git worktree, a Rift workspace's commits live only in its own `.git`. A workspace without a `.git` of its own is not
@@ -70,9 +79,10 @@ export async function unsaved(
   directory: string,
   parent: () => Promise<string | undefined>,
   signal: AbortSignal,
-): Promise<string | undefined> {
-  if (!existsSync(path.join(directory, ".git"))) return
+): Promise<Check> {
+  if (!existsSync(path.join(directory, ".git"))) return { reason: undefined, unchanged: async () => true }
   const repositories = await snapshot(directory, signal)
+  const fingerprint = JSON.stringify(repositories)
   let source: Promise<string | undefined> | undefined
   const reaches = async (repository: Repository, head: string) => {
     const root = await (source ??= parent())
@@ -106,6 +116,8 @@ export async function unsaved(
     commits.length > 0 &&
       `${commits.length} commit${commits.length === 1 ? "" : "s"} no remote branch has (${list(commits)}); push ${commits.length === 1 ? "it" : "them"}`,
   ].filter((reason) => typeof reason === "string")
-  if (reasons.length === 0) return
-  return `${directory} has ${reasons.join(", and ")}. Remove it with force to discard them.`
+  return {
+    reason: reasons.length ? `${directory} has ${reasons.join(", and ")}. Remove it with force to discard them.` : undefined,
+    unchanged: async () => JSON.stringify(await snapshot(directory, signal)) === fingerprint,
+  }
 }

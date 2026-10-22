@@ -66,6 +66,23 @@ export function makeStrategy(value: Record<string, unknown> = {}, runtime: Runti
     return value as string[]
   }
 
+  // Rift's remove takes no precondition, so the check runs just before it: the state the reason came from is read
+  // again right before removal, and a workspace that changed in between is checked once more, then refused.
+  const keepUnsaved = async (directory: string, signal: AbortSignal) => {
+    const parent = async () => paths(await request({ command: "ancestors", of: directory }, signal))[0]
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const check = await inspect(directory, parent, signal).catch((error) => {
+        throw failure(error)
+      })
+      if (check.reason) throw new Worktree.OperationError({ message: check.reason, forceRequired: true })
+      const unchanged = await check.unchanged().catch((error) => {
+        throw failure(error)
+      })
+      if (unchanged) return
+    }
+    throw new Worktree.OperationError({ message: `${directory} kept changing while it was checked; try again` })
+  }
+
   return {
     id: "rift",
     async create(input: { sourceDirectory: string; directory: string; branch?: string }, context: { signal: AbortSignal }) {
@@ -114,14 +131,7 @@ export function makeStrategy(value: Record<string, unknown> = {}, runtime: Runti
       if (children.length)
         throw new Worktree.OperationError({ message: "Remove this Rift's child workspaces first" })
       // Like `git worktree remove`, only force discards work; here that includes commits only this workspace has.
-      if (!input.force) {
-        const parent = async () =>
-          paths(await request({ command: "ancestors", of: input.directory }, context.signal))[0]
-        const reason = await inspect(input.directory, parent, context.signal).catch((error) => {
-          throw failure(error)
-        })
-        if (reason) throw new Worktree.OperationError({ message: reason, forceRequired: true })
-      }
+      if (!input.force) await keepUnsaved(input.directory, context.signal)
       try {
         await request({ command: "remove", at: input.directory, hooks: options.hooks }, context.signal)
       } catch (error) {

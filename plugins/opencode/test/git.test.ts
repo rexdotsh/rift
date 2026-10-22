@@ -204,11 +204,41 @@ describe("unsaved work check", () => {
     writeFileSync(path.join(untracked, "draft.txt"), "x\n")
     await expect(check(untracked)).resolves.toMatch("uncommitted changes (draft.txt)")
 
+    const insideSubmodule = copy("submodule-untracked-hidden")
+    run(path.join(insideSubmodule, "lib"), "config", "status.showUntrackedFiles", "no")
+    writeFileSync(path.join(insideSubmodule, "lib", "draft.txt"), "x\n")
+    await expect(check(insideSubmodule)).resolves.toMatch("lib/draft.txt")
+
     // The submodule's new commit is pushed, but the superproject's gitlink change is only here.
     const gitlink = copy("gitlink-ignored")
     run(gitlink, "config", "submodule.lib.ignore", "all")
     commit(path.join(gitlink, "lib"), "pushed")
     run(path.join(gitlink, "lib"), "push", "-q", "origin", "HEAD:main")
     await expect(check(gitlink)).resolves.toMatch("uncommitted changes (lib)")
+  })
+  test("checks commits in initialized submodules against the matching parent submodule", async () => {
+    const { source, copy, commit, run } = workspaces({ submodule: true })
+    // Only the superproject is pushed; its gitlink points at a commit only this workspace's submodule has.
+    const child = copy("submodule-unpushed")
+    commit(path.join(child, "lib"), "local")
+    run(child, "add", "lib")
+    run(child, "commit", "-q", "-m", "bump lib")
+    run(child, "push", "-q", "--recurse-submodules=no", "origin", "HEAD:main")
+    await expect(check(child, source)).resolves.toMatch(/1 commit no remote branch has \(lib: [0-9a-f]+ local\)/)
+
+    // The parent and its own submodule still reach their unpushed commits, so a copy of them loses nothing.
+    commit(path.join(source, "lib"), "parent-local")
+    run(source, "add", "lib")
+    run(source, "commit", "-q", "-m", "bump lib in parent")
+    const copied = copy("submodule-from-parent")
+    await expect(check(copied, source)).resolves.toBeUndefined()
+    await expect(check(copied)).resolves.toMatch(/2 commits no remote branch has \([0-9a-f]+ bump lib in parent, lib: /)
+  })
+
+  test("refuses when a submodule can't be read", async () => {
+    const { copy } = workspaces({ submodule: true })
+    const broken = copy("submodule-broken")
+    writeFileSync(path.join(broken, "lib", ".git"), "gitdir: ../.git/modules/missing\n")
+    await expect(unsaved(broken, async () => undefined, context.signal)).rejects.toThrow("lib")
   })
 })

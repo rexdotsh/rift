@@ -50,7 +50,7 @@ process.stdin.on("end", () => {
   return executable
 }
 
-async function setup(executable: string) {
+async function setup(executable: string, workspaces: string[] = ["/worktrees/task"]) {
   const tools = new Map<string, Tool>()
   let strategy: Strategy | undefined
   const signal = new AbortController().signal
@@ -63,7 +63,8 @@ async function setup(executable: string) {
       transform: async (callback: (editor: { add: (definition: Strategy) => void }) => void) => {
         callback({ add: (definition) => (strategy = definition) })
       },
-      list: async () => [{ directory: "/project" }],
+      refresh: async () => {},
+      list: async () => [{ directory: "/project" }, ...workspaces.map((directory) => ({ directory, strategy: "rift" }))],
       create: (input: { from: string; name: string }) =>
         strategy!.create({ sourceDirectory: input.from, directory: `/worktrees/${input.name}` }, { signal }),
       remove: (input: { directory: string; force: boolean }) => strategy!.remove(input, { signal }),
@@ -104,8 +105,8 @@ test("rift.remove reports a failed postremove hook to the agent", async () => {
 })
 
 test("rift.remove keeps a workspace with uncommitted changes unless forced", async () => {
-  const tools = await setup(await fakeRift())
   const directory = await mkdtemp(join(temp, "workspace-"))
+  const tools = await setup(await fakeRift(), [directory])
   execFileSync("git", ["init", "-q", directory])
   await writeFile(join(directory, "notes.txt"), "draft\n")
   await expect(tools.get("remove")!.execute({ directory }, { sessionID: "session" })).rejects.toThrow(
@@ -113,6 +114,13 @@ test("rift.remove keeps a workspace with uncommitted changes unless forced", asy
   )
   const result = await tools.get("remove")!.execute({ directory, force: true }, { sessionID: "session" })
   expect(result.content).toBe(`Removed ${directory}.`)
+})
+
+test("rift.remove names a workspace that belongs to another project instead of failing silently", async () => {
+  const tools = await setup(await fakeRift(), [])
+  await expect(tools.get("remove")!.execute({ directory: "/worktrees/task" }, { sessionID: "session" })).rejects.toThrow(
+    "/worktrees/task is not a Rift workspace of this session's project",
+  )
 })
 
 test("successful hooks add no warning", async () => {

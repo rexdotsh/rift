@@ -143,6 +143,15 @@ export async function registerTools(ctx: Context, listeners: Listeners) {
         const session = await ctx.session.get({ sessionID: tool.sessionID })
         if (contains(value.directory, session.location.directory))
           throw new Error("Move this session out of the Rift before removing it")
+        // OpenCode only knows the session's project's workspaces; asked for another's, it fails with no message.
+        await ctx.worktree.refresh({ projectID: session.projectID })
+        const known = (await ctx.worktree.list({ projectID: session.projectID })).some(
+          (entry) => entry.strategy === "rift" && entry.directory === value.directory,
+        )
+        if (!known)
+          throw new Error(
+            `${value.directory} is not a Rift workspace of this session's project; move the session to the checkout it was made from and remove it there`,
+          )
         const { warning } = await watch(listeners, () =>
           ctx.worktree.remove({
             projectID: session.projectID,
